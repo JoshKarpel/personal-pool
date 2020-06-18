@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 import enum
 import contextlib
+import signal
 
 import htcondor
 import classad
@@ -130,6 +131,7 @@ class PersonalPool:
         config: Mapping[str, str] = None,
         raw_config: str = None,
         detach: bool = False,
+        use_config: bool = True,
     ):
         """
         Parameters
@@ -167,6 +169,11 @@ class PersonalPool:
         self.raw_config = raw_config or ""
 
         self.condor_master = None
+
+        if use_config:
+            logger.debug("Setting CONDOR_CONFIG globally for {}".format(self))
+            self._write_config()
+            self.use_config().set()
 
     @property
     def state(self):
@@ -269,6 +276,8 @@ class PersonalPool:
             dir.mkdir(parents=True, exist_ok=True)
 
     def _write_config(self):
+        self.config_file.parent.mkdir(parents=True, exist_ok=True)
+
         param_lines = []
 
         param_lines += ["#", "# INHERITED", "#"]
@@ -393,14 +402,15 @@ class PersonalPool:
 
         raise TimeoutError("Standup for {} failed".format(self))
 
+    def who(self):
+        who = self.run_command(["condor_who", "-quick"])
+        try:
+            return classad.parseOne(who.stdout)
+        except Exception:
+            return classad.ClassAd()
+
     def _is_ready(self) -> bool:
-        who = self.run_command(["condor_who", "-quick"],)
-        if who.stdout.strip() == "":
-            return False
-
-        who_ad = classad.parseOne(who.stdout)
-
-        return bool(who_ad.get("IsReady"))
+        return self.who().get("IsReady", False)
 
     @skip_if(
         PersonalPoolState.STOPPED,
@@ -470,9 +480,9 @@ class PersonalPool:
         killed = False
         while True:
             try:
-                self.condor_master.communicate(timeout=5)
+                self.condor_master.wait(timeout=5)
                 break
-            except TimeoutError:
+            except subprocess.TimeoutExpired:
                 pass
 
             elapsed = time.time() - start
@@ -561,6 +571,50 @@ class PersonalPool:
     def detach(self):
         self._detach = True
         return self
+
+    def attach(self):
+        if not self._is_ready():
+            raise Exception(
+                "There is not already a running HTCondor instance for {}".format(self)
+            )
+
+        self.condor_master = AttachedCondorMaster(pid=self.who()["MASTER_PID"])
+        self.state = PersonalPoolState.READY
+
+        return self
+
+
+# TODO: cannot use os.waitpid on non-child process... need to do something else in that case
+# TODO: does this work on windows?
+class AttachedCondorMaster:
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.returncode = None
+
+    def poll(self):
+        if self.returncode is None:
+            pid, returncode = os.waitpid(self.pid, os.WNOHANG)
+            if pid == self.pid:
+                self.returncode = returncode
+
+        return self.returncode
+
+    def wait(self, timeout: float):
+        end = time.time() + timeout
+        while True:
+            if self.poll() is not None:
+                break
+            if time.time() > end:
+                raise subprocess.TimeoutExpired("condor_master", timeout)
+            time.sleep(0.0005)
+
+        return self.returncode
+
+    def terminate(self):
+        os.kill(self.pid, signal.SIGTERM)
+
+    def kill(self):
+        os.kill(self.pid, signal.SIGKILL)
 
 
 def set_env_var(key: str, value: str):

@@ -16,17 +16,13 @@ def print_ad(ad):
 path = Path.cwd() / "test-condor"
 shutil.rmtree(path, ignore_errors=True)
 
-with PersonalPool(path, config={"foo": "bar"}) as pool:
-    print(
-        pool.run_command(
-            ["condor_config_val", "-dump", "ALLOW", "UID_DOMAIN", "self"]
-        ).stdout
-    )
-    print(pool.run_command(["condor_status"]).stdout)
-    print(pool.run_command(["condor_submit", "test.sub"]).stdout)
-    print(pool.run_command(["condor_q"]).stdout)
-    print(pool.get_config_val("LOCAL_DIR"))
+p = PersonalPool().start()
 
-    off = pool.run_command(["condor_off"])
-    print(off.stdout)
-    print(off.stderr)
+p2 = PersonalPool().attach()
+
+print(p)
+print(p2)
+
+# p.stop()
+
+p2.stop()
