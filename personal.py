@@ -129,6 +129,7 @@ class PersonalPool:
         local_dir: Optional[Path] = None,
         config: Mapping[str, str] = None,
         raw_config: str = None,
+        detach: bool = False,
     ):
         """
         Parameters
@@ -147,6 +148,8 @@ class PersonalPool:
         if local_dir is None:
             local_dir = Path.home() / ".condor" / "personal"
         self.local_dir = local_dir.absolute()
+
+        self._detach = detach
 
         self.execute_dir = self.local_dir / "execute"
         self.lock_dir = self.local_dir / "lock"
@@ -403,6 +406,10 @@ class PersonalPool:
         PersonalPoolState.INITIALIZED,
     )
     def stop(self):
+        if self._detach:
+            logger.debug("Will not stop {} because it is detached".format(self))
+            return
+
         logger.info("Stopping {}".format(self))
 
         self.state = PersonalPoolState.STOPPING
@@ -548,6 +555,10 @@ class PersonalPool:
 
     def get_config_val(self, variable: str) -> str:
         return self.run_command(["condor_config_val", str(variable)]).stdout
+
+    def detach(self):
+        self._detach = True
+        return self
 
 
 def set_env_var(key: str, value: str):
