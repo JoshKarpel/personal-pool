@@ -215,12 +215,14 @@ class PersonalPool:
         return self.condor_master is not None and self.condor_master.poll() is None
 
     def __enter__(self):
+        self.use_config().set()
         self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         logger.debug("Stop triggered for {} by context exit.".format(self))
         self.stop()
+        self.use_config().unset()
 
     def __del__(self):
         logger.debug("Stop triggered for {} by object deletion.".format(self))
@@ -588,20 +590,25 @@ class SetEnv:
         self.mapping = mapping
         self.previous_values = None
 
-    def __enter__(self):
+    def set(self):
         self.previous_values = {
             key: os.environ.get(key, self.UNSET) for key in self.mapping.keys()
         }
         os.environ.update(self.mapping)
 
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def unset(self):
         for key, prev_val in self.previous_values.items():
             if prev_val is not self.UNSET:
                 set_env_var(key, prev_val)
             else:
                 unset_env_var(key)
+
+    def __enter__(self):
+        self.set()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.unset()
 
 
 class SetCondorConfig:
@@ -615,21 +622,26 @@ class SetCondorConfig:
         self.config_file = Path(config_file)
         self.previous_value = None
 
-    def __enter__(self):
+    def set(self):
         self.previous_value = os.environ.get("CONDOR_CONFIG", None)
         set_env_var("CONDOR_CONFIG", str(self.config_file))
 
         htcondor.reload_config()
 
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def unset(self):
         if self.previous_value is not None:
             set_env_var("CONDOR_CONFIG", self.previous_value)
         else:
             unset_env_var("CONDOR_CONFIG")
 
         htcondor.reload_config()
+
+    def __enter__(self):
+        self.set()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.unset()
 
 
 def run_command(
