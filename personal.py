@@ -25,8 +25,10 @@ import textwrap
 import time
 from pathlib import Path
 import enum
+import contextlib
 
 import htcondor
+import classad
 
 logger = logging.getLogger(__name__)
 
@@ -143,8 +145,8 @@ class PersonalPool:
         atexit.register(self._atexit)
 
         if local_dir is None:
-            local_dir = Path.cwd() / ".condor-personal"
-        self.local_dir = local_dir
+            local_dir = Path.home() / ".condor-personal"
+        self.local_dir = local_dir.absolute()
 
         self.execute_dir = self.local_dir / "execute"
         self.lock_dir = self.local_dir / "lock"
@@ -174,8 +176,16 @@ class PersonalPool:
         logger.debug("State of {} changed from {} to {}".format(self, old_state, state))
 
     def __repr__(self):
+        shortest_path = min(
+            (
+                str(self.local_dir),
+                "~/" + str(try_relative_to(self.local_dir, Path.home())),
+                "./" + str(try_relative_to(self.local_dir, Path.cwd())),
+            ),
+            key=len,
+        )
         return "{}(local_dir = {}, state = {})".format(
-            type(self).__name__, self.local_dir, self.state
+            type(self).__name__, shortest_path, self.state
         )
 
     def use_config(self):
@@ -185,15 +195,17 @@ class PersonalPool:
         """
         return SetCondorConfig(self.config_file)
 
+    @contextlib.contextmanager
     def schedd(self):
-        """Return the :class:`htcondor.Schedd` for this pool's schedd."""
+        """Yield the :class:`htcondor.Schedd` for this pool's schedd."""
         with self.use_config():
-            return htcondor.Schedd()
+            yield htcondor.Schedd()
 
+    @contextlib.contextmanager
     def collector(self):
-        """Return the :class:`htcondor.Collector` for this pool's collector."""
+        """Yield the :class:`htcondor.Collector` for this pool's collector."""
         with self.use_config():
-            return htcondor.Collector()
+            yield htcondor.Collector()
 
     @property
     def master_is_alive(self):
@@ -215,7 +227,6 @@ class PersonalPool:
         logger.debug("Stop triggered for {} by interpreter shutdown.".format(self))
         self.stop()
 
-    @skip_if(PersonalPoolState.READY)
     def start(self):
         logger.info("Starting {}".format(self))
 
@@ -223,11 +234,15 @@ class PersonalPool:
             self._initialize()
             self._ready()
         except BaseException:
-            logger.exception("Encountered error during setup of {}, cleaning up!".format(self))
+            logger.exception(
+                "Encountered error during setup of {}, cleaning up!".format(self)
+            )
             self.stop()
             raise
 
         logger.info("Started {}".format(self))
+
+        return self
 
     @skip_if(PersonalPoolState.INITIALIZED)
     def _initialize(self):
@@ -251,23 +266,10 @@ class PersonalPool:
     def _write_config(self):
         param_lines = []
 
-        # TODO: switch to -summary instead of -write:up
-        write = run_command(["condor_config_val", "-dump"])
-        if write.returncode != 0:
-            raise Exception("Failed to copy base OS config: {}".format(write.stderr))
-
         param_lines += ["#", "# INHERITED", "#"]
-        for line in write.stdout.splitlines():
-            line = line.strip()
-
-            if line == "" or line.startswith("#"):
+        for k, v in htcondor.param.items():
+            if k not in INHERIT:
                 continue
-
-            k, v = (x.strip() for x in line.split("=", 1))
-
-            if k not in INHERIT or v == "":
-                continue
-
             param_lines += ["{} = {}".format(k, v)]
 
         param_lines += ["#", "# ROLES", "#"]
@@ -303,7 +305,6 @@ class PersonalPool:
             f.write("\n".join(param_lines))
 
     def _ready(self):
-        # TODO: check for existing running condor using address files and condor_who -quick?
         self._start_condor()
         self._wait_for_ready()
 
@@ -313,14 +314,22 @@ class PersonalPool:
 
     @skip_if(PersonalPoolState.STARTED)
     def _start_condor(self):
+        if self._is_ready():
+            raise Exception("Cannot start a second PersonalPool in the same local_dir")
+
         with SetCondorConfig(self.config_file):
             self.condor_master = subprocess.Popen(
                 ["condor_master", "-f"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            logger.debug("Started condor_master (pid {})".format(self.condor_master.pid))
+            self.state = PersonalPoolState.STARTED
+            logger.debug(
+                "Started condor_master (pid {}) for {}".format(
+                    self.condor_master.pid, self
+                )
+            )
 
     def _daemons(self):
-        return set(self.config_val("DAEMON_LIST").split(" "))
+        return set(self.get_config_val("DAEMON_LIST").split(" "))
 
     @skip_if(PersonalPoolState.READY)
     def _wait_for_ready(self, timeout=120):
@@ -328,7 +337,9 @@ class PersonalPool:
         master_log_path = self.master_log
 
         logger.debug(
-            "Starting up daemons for {}, waiting for: {}".format(self, " ".join(sorted(daemons)))
+            "Starting up daemons for {}, waiting for: {}".format(
+                self, " ".join(sorted(daemons))
+            )
         )
 
         start = time.time()
@@ -346,7 +357,9 @@ class PersonalPool:
                 continue
 
             who = self.run_command(
-                shlex.split("condor_who -wait:10 'IsReady && STARTD_State =?= \"Ready\"'"),
+                shlex.split(
+                    "condor_who -wait:10 'IsReady && STARTD_State =?= \"Ready\"'"
+                ),
             )
             if who.stdout.strip() == "":
                 logger.debug(
@@ -357,12 +370,12 @@ class PersonalPool:
                 time.sleep(1)
                 continue
 
-            who_ad = dict(kv.split(" = ") for kv in who.stdout.splitlines())
+            who_ad = classad.parseOne(who.stdout)
 
             if (
-                who_ad.get("IsReady") == "true"
-                and who_ad.get("STARTD_State") == '"Ready"'
-                and all(who_ad.get(d) == '"Alive"' for d in daemons)
+                who_ad.get("IsReady")
+                and who_ad.get("STARTD_State") == "Ready"
+                and all(who_ad.get(d) == "Alive" for d in daemons)
             ):
                 self.state = PersonalPoolState.READY
                 return
@@ -375,8 +388,19 @@ class PersonalPool:
 
         raise TimeoutError("Standup for {} failed".format(self))
 
+    def _is_ready(self) -> bool:
+        who = self.run_command(["condor_who", "-quick"],)
+        if who.stdout.strip() == "":
+            return False
+
+        who_ad = classad.parseOne(who.stdout)
+
+        return bool(who_ad.get("IsReady"))
+
     @skip_if(
-        PersonalPoolState.STOPPED, PersonalPoolState.UNINITIALIZED, PersonalPoolState.INITIALIZED,
+        PersonalPoolState.STOPPED,
+        PersonalPoolState.UNINITIALIZED,
+        PersonalPoolState.INITIALIZED,
     )
     def stop(self):
         logger.info("Stopping {}".format(self))
@@ -398,12 +422,14 @@ class PersonalPool:
 
         if not off.returncode == 0:
             logger.error(
-                "condor_off failed, exit code: {}, stderr: {}".format(off.returncode, off.stderr)
+                "condor_off failed for {}, exit code: {}, stderr: {}".format(
+                    self, off.returncode, off.stderr
+                )
             )
             self._terminate_condor_master()
             return
 
-        logger.debug("condor_off succeeded: {}".format(off.stdout))
+        logger.debug("condor_off succeeded for {}: {}".format(self, off.stdout))
 
     def _terminate_condor_master(self):
         if not self.master_is_alive:
@@ -411,12 +437,18 @@ class PersonalPool:
 
         self.condor_master.terminate()
         logger.debug(
-            "Sent terminate signal to condor_master (pid {})".format(self.condor_master.pid)
+            "Sent terminate signal to condor_master (pid {}) for {}".format(
+                self.condor_master.pid, self
+            )
         )
 
     def _kill_condor_master(self):
         self.condor_master.kill()
-        logger.debug("Sent kill signal to condor_master (pid {})".format(self.condor_master.pid))
+        logger.debug(
+            "Sent kill signal to condor_master (pid {}) for {}".format(
+                self.condor_master.pid, self
+            )
+        )
 
     def _wait_for_master_to_terminate(self, kill_after=60, timeout=120):
         logger.debug(
@@ -438,8 +470,8 @@ class PersonalPool:
 
             if not killed:
                 logger.debug(
-                    "condor_master has not terminated yet, will kill in {} seconds".format(
-                        int(kill_after - elapsed)
+                    "condor_master for {} has not terminated yet, will kill in {} seconds".format(
+                        self, int(kill_after - elapsed)
                     )
                 )
 
@@ -450,16 +482,15 @@ class PersonalPool:
                 killed = True
 
             if elapsed > timeout:
-                raise TimeoutError("Timed out while waiting for condor_master to terminate")
+                raise TimeoutError(
+                    "Timed out while waiting for condor_master to terminate"
+                )
 
         logger.debug(
-            "condor_master (pid {}) has terminated with exit code {}".format(
-                self.condor_master.pid, self.condor_master.returncode
+            "condor_master (pid {}) for {} has terminated with exit code {}".format(
+                self.condor_master.pid, self, self.condor_master.returncode
             )
         )
-
-    def read_config(self):
-        return self.config_file.read_text()
 
     def run_command(self, *args, **kwargs):
         """
@@ -510,14 +541,13 @@ class PersonalPool:
         return self._get_address_file("STARTD").read_text().splitlines()[0]
 
     def _get_log_path(self, subsystem: str) -> Path:
-        return Path(self.config_val("{}_LOG".format(subsystem)))
+        return Path(self.get_config_val("{}_LOG".format(subsystem)))
 
     def _get_address_file(self, subsystem: str) -> Path:
-        return Path(self.config_val("{}_ADDRESS_FILE".format(subsystem)))
+        return Path(self.get_config_val("{}_ADDRESS_FILE".format(subsystem)))
 
-    def config_val(self, variable: str) -> str:
-        with self.use_config():
-            return htcondor.param[variable]
+    def get_config_val(self, variable: str) -> str:
+        return self.run_command(["condor_config_val", str(variable)]).stdout
 
 
 def set_env_var(key: str, value: str):
@@ -548,7 +578,9 @@ class SetEnv:
         self.previous_values = None
 
     def __enter__(self):
-        self.previous_values = {key: os.environ.get(key, self.UNSET) for key in self.mapping.keys()}
+        self.previous_values = {
+            key: os.environ.get(key, self.UNSET) for key in self.mapping.keys()
+        }
         os.environ.update(self.mapping)
 
         return self
@@ -636,67 +668,8 @@ def run_command(
     return p
 
 
-#
-# PLATFORM_CONFIGS = {
-#     "RedHat": "/usr/share/doc/condor-{version}/etc/examples/condor_config.generic",
-#     "RedHat v8.4.x": "/usr/share/doc/condor-${condorVersion}/examples/condor_config.generic",
-#     "CentOS 8": "/usr/share/doc/condor/examples/condor_config.generic",
-#     "Debian <9": "/usr/share/doc/condor/etc/examples/condor_config.generic",
-#     "Debian 9": "/usr/share/doc/htcondor/examples/etc/condor_config.generic",
-#     "Traditional": "/usr/local/condor/etc/examples/condor_config.generic",
-#     "Windows": "${hostCondorDir}/etc/condor_config.generic",
-# }
-#
-# EXTRACT_HTCONDOR_VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)", flags=re.ASCII)
-#
-# BINDINGS_VERSION_INFO = parse_version(
-#     EXTRACT_HTCONDOR_VERSION_RE.search(htcondor.version()).group(0)
-# )
-#
-# def find_generic_config():
-#     for name, location in PLATFORM_CONFIGS.items():
-#         if Path(location.format(version = htcondor))
-
-# sub findHostCondorConfigGeneric {
-#     my( $hostCondorDir ) = @_;
-#     # Check /usr/share/doc/condor-* and /usr/local/condor-* for the
-#     # Condor version in the PATH.
-#     my $condorVersion = getCondorVersion();
-#     if( ! defined( $condorVersion ) ) {
-#         debug( 4, "Unable to determine host's Condor version while looking for its condor_config.generic.\n" );
-#         return undef;
-#     }
-#     #
-#     # RedHat et alia.
-#     #
-#     my $ccg = "/usr/share/doc/condor-${condorVersion}/etc/examples/condor_config.generic";
-#     if( -e $ccg ) { return $ccg; }
-#     # RedHat et alia, v8.4.x.
-#     $ccg = "/usr/share/doc/condor-${condorVersion}/examples/condor_config.generic";
-#     if( -e $ccg ) { return $ccg; }
-#     # CentOS 8 et alia
-#     $ccg = "/usr/share/doc/condor/examples/condor_config.generic";
-#     if( -e $ccg ) { return $ccg; }
-#     #
-#     # Debian et alia (before Debian 9).
-#     #
-#     $ccg = "/usr/share/doc/condor/etc/examples/condor_config.generic";
-#     if( -e $ccg ) { return $ccg; }
-#     #
-#     # Debian 9.
-#     #
-#     $ccg = "/usr/share/doc/htcondor/examples/etc/condor_config.generic";
-#     if( -e $ccg ) { return $ccg; }
-#     #
-#     # Traditional, versioned.
-#     #
-#     $ccg = "/usr/local/condor/etc/examples/condor_config.generic";
-#     if( -e $ccg ) { return $ccg; }
-#     #
-#     # Windows.
-#     #
-#     $ccg = "${hostCondorDir}/etc/condor_config.generic";
-#     if( -e $ccg ) { return $ccg; }
-#     debug( 4, "Did not find host's condor_config.generic.\n" );
-#     return undef;
-# } # end findHostCondorConfigGeneric()
+def try_relative_to(path: Path, to: Path) -> Path:
+    try:
+        return path.relative_to(to)
+    except ValueError:
+        return path

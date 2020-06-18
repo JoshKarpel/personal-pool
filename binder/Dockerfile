@@ -17,8 +17,16 @@ FROM htcondor/htc-scipy-notebook:latest
 
 USER root
 
-USER ${NB_UID}:${NB_GID}
+RUN : \
+ && apt-get update \
+ && apt-get install -y psmisc \
+ && apt-get clean -y \
+ && rm -rf /var/lib/apt/lists/* \
+ && echo 'exec "$@"' > /.entrypoint \
+ && rm /home/jovyan/.condor/user_config \
+ && :
 
+USER ${NB_UID}:${NB_GID}
 
 WORKDIR ${HOME}/demo
 COPY . ${HOME}/demo
