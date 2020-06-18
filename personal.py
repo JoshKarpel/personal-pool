@@ -145,7 +145,7 @@ class PersonalPool:
         atexit.register(self._atexit)
 
         if local_dir is None:
-            local_dir = Path.home() / ".condor-personal"
+            local_dir = Path.home() / ".condor" / "personal"
         self.local_dir = local_dir.absolute()
 
         self.execute_dir = self.local_dir / "execute"
