@@ -34,8 +34,8 @@ import classad
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
-    "ALL_DEBUG": "D_ALL",
-    "TOOL_DEBUG": "D_ALL",
+    # "ALL_DEBUG": "D_ALL",
+    # "TOOL_DEBUG": "D_ALL",
     "LOCAL_CONFIG_FILE": "",
     "MASTER_ADDRESS_FILE": "$(LOG)/.master_address",
     "COLLECTOR_ADDRESS_FILE": "$(LOG)/.collector_address",
@@ -92,12 +92,14 @@ INHERIT = {
 
 
 def skip_if(*states):
+    states = set(states)
+
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
             if self.state in states:
                 logger.debug(
-                    "Skipping call to {} for {} because its state is {}".format(
+                    "Skipping call to {} for {} because it is {}".format(
                         func.__name__, self, self.state
                     )
                 )
@@ -113,10 +115,13 @@ def skip_if(*states):
 class PersonalPoolState(str, enum.Enum):
     UNINITIALIZED = "uninitialized"
     INITIALIZED = "initialized"
-    STARTED = "started"
+    STARTING = "starting"
     READY = "ready"
     STOPPING = "stopping"
     STOPPED = "stopped"
+
+
+NO_DEFAULT = object()
 
 
 class PersonalPool:
@@ -129,7 +134,7 @@ class PersonalPool:
         self,
         local_dir: Optional[Path] = None,
         config: Mapping[str, str] = None,
-        raw_config: str = None,
+        raw_config: Optional[str] = None,
         detach: bool = False,
         use_config: bool = True,
     ):
@@ -165,14 +170,13 @@ class PersonalPool:
 
         if config is None:
             config = {}
-        self.config = {k: v if v is not None else "" for k, v in config.items()}
-        self.raw_config = raw_config or ""
+        self._config = {k: v if v is not None else "" for k, v in config.items()}
+        self._raw_config = raw_config or ""
 
         self.condor_master = None
 
         if use_config:
             logger.debug("Setting CONDOR_CONFIG globally for {}".format(self))
-            self._write_config()
             self.use_config().set()
 
     @property
@@ -223,7 +227,6 @@ class PersonalPool:
 
     def __enter__(self):
         self.use_config().set()
-        self.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -239,12 +242,14 @@ class PersonalPool:
         logger.debug("Stop triggered for {} by interpreter shutdown.".format(self))
         self.stop()
 
+    @skip_if(PersonalPoolState.READY)
     def start(self):
         logger.info("Starting {}".format(self))
 
         try:
-            self._initialize()
-            self._ready()
+            self.initialize()
+            self._start_condor()
+            self._wait_for_ready()
         except BaseException:
             logger.exception(
                 "Encountered error during setup of {}, cleaning up!".format(self)
@@ -256,10 +261,14 @@ class PersonalPool:
 
         return self
 
-    @skip_if(PersonalPoolState.INITIALIZED)
-    def _initialize(self):
+    @skip_if(
+        PersonalPoolState.INITIALIZED,
+        PersonalPoolState.STARTING,
+        PersonalPoolState.READY,
+    )
+    def initialize(self, overwrite_config=True):
         self._setup_local_dirs()
-        self._write_config()
+        self._write_config(overwrite=overwrite_config)
         self.state = PersonalPoolState.INITIALIZED
 
     def _setup_local_dirs(self):
@@ -275,7 +284,12 @@ class PersonalPool:
         ):
             dir.mkdir(parents=True, exist_ok=True)
 
-    def _write_config(self):
+    def _write_config(self, overwrite=True):
+        if not overwrite and self.config_file.exists():
+            raise Exception(
+                f"Found existing config file; refusing to write config because overwrite={overwrite}."
+            )
+
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
 
         param_lines = []
@@ -303,44 +317,43 @@ class PersonalPool:
             "SEC_TOKEN_SYSTEM_DIRECTORY": self.tokens_dir.as_posix(),
         }
 
-        param_lines += ["#", "# BASE PARAMS", "#"]
+        param_lines += ["# BASE PARAMS"]
         param_lines += ["{} = {}".format(k, v) for k, v in base_config.items()]
 
-        param_lines += ["#", "# DEFAULT PARAMS", "#"]
+        param_lines += ["# DEFAULT PARAMS"]
         param_lines += ["{} = {}".format(k, v) for k, v in DEFAULT_CONFIG.items()]
 
-        param_lines += ["#", "# CUSTOM PARAMS", "#"]
-        param_lines += ["{} = {}".format(k, v) for k, v in self.config.items()]
+        param_lines += ["# CUSTOM PARAMS"]
+        param_lines += ["{} = {}".format(k, v) for k, v in self._config.items()]
 
-        param_lines += ["#", "# RAW PARAMS", "#"]
-        param_lines += textwrap.dedent(self.raw_config).splitlines()
+        param_lines += ["# RAW PARAMS"]
+        param_lines += textwrap.dedent(self._raw_config).splitlines()
 
         with self.config_file.open(mode="a") as f:
             f.write("\n".join(param_lines))
-
-    def _ready(self):
-        self._start_condor()
-        self._wait_for_ready()
 
     @property
     def _has_master(self):
         return self.condor_master is not None
 
-    @skip_if(PersonalPoolState.STARTED)
+    @skip_if(PersonalPoolState.STARTING, PersonalPoolState.READY)
     def _start_condor(self):
         if self._is_ready():
-            raise Exception("Cannot start a second PersonalPool in the same local_dir")
+            raise Exception(
+                f"Cannot start a {type(self).__name__} in the same local_dir as an already-running {type(self).__name__}."
+            )
 
         with SetCondorConfig(self.config_file):
             self.condor_master = subprocess.Popen(
                 ["condor_master", "-f"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            self.state = PersonalPoolState.STARTED
             logger.debug(
                 "Started condor_master (pid {}) for {}".format(
                     self.condor_master.pid, self
                 )
             )
+
+        self.state = PersonalPoolState.STARTING
 
     def _daemons(self):
         return set(self.get_config_val("DAEMON_LIST").split(" "))
@@ -565,23 +578,32 @@ class PersonalPool:
     def _get_address_file(self, subsystem: str) -> Path:
         return Path(self.get_config_val("{}_ADDRESS_FILE".format(subsystem)))
 
-    def get_config_val(self, variable: str) -> str:
-        return self.run_command(["condor_config_val", str(variable)]).stdout
+    def get_config_val(self, variable, default=NO_DEFAULT):
+        with self.use_config():
+            try:
+                return htcondor.param[variable]
+            except KeyError:
+                if default is not NO_DEFAULT:
+                    return default
+                raise
 
     def detach(self):
         self._detach = True
         return self
 
-    def attach(self):
-        if not self._is_ready():
+    @classmethod
+    def attach(cls, local_dir):
+        pool = cls(local_dir=local_dir)
+
+        if not pool._is_ready():
             raise Exception(
-                "There is not already a running HTCondor instance for {}".format(self)
+                "There is not already a running HTCondor instance for {}".format(pool)
             )
 
-        self.condor_master = AttachedCondorMaster(pid=self.who()["MASTER_PID"])
-        self.state = PersonalPoolState.READY
+        pool.condor_master = AttachedCondorMaster(pid=pool.who()["MASTER_PID"])
+        pool.state = PersonalPoolState.READY
 
-        return self
+        return pool
 
 
 # TODO: cannot use os.waitpid on non-child process... need to do something else in that case
