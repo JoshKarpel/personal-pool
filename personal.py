@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Mapping, List
+from typing import Optional, Mapping, List, Set, Union
 
 import logging
 import atexit
@@ -121,9 +121,6 @@ class PersonalPoolState(str, enum.Enum):
     STOPPED = "stopped"
 
 
-NO_DEFAULT = object()
-
-
 class PersonalPool:
     """
     A :class:`PersonalCondor` is responsible for managing the lifecycle of a
@@ -142,12 +139,25 @@ class PersonalPool:
         Parameters
         ----------
         local_dir
-            The local directory for the HTCondor pool. All HTCondor state will
-            be stored in this directory.
+            The local directory for the personal HTCondor pool.
+            All configuration and state for the personal pool
+            will be stored in this directory.
         config
-            HTCondor configuration parameters to inject, as a mapping of key-value pairs.
+            HTCondor configuration parameters to inject,
+            as a mapping of key-value pairs.
         raw_config
-            Raw HTCondor configuration language to inject, as a string.
+            Raw HTCondor configuration language to inject,
+            as a string.
+        detach
+            If ``True``, the personal HTCondor pool will not be shut down
+            when this object is destroyed (e.g., by stopping Python).
+            Defaults to ``False``.
+        use_config
+            If ``True``, the environment variable ``CONDOR_CONFIG`` will be
+            set during initialization, such that this personal pool appears to
+            be the local HTCondor pool for all operations in this Python session,
+            even ones that don't go through the :class:`PersonalPool` object.
+            Defaults to ``True``.
         """
         self._state = PersonalPoolState.UNINITIALIZED
         atexit.register(self._atexit)
@@ -181,6 +191,7 @@ class PersonalPool:
 
     @property
     def state(self):
+        """The current :class:`PersonalPoolState` of the personal pool."""
         return self._state
 
     @state.setter
@@ -211,18 +222,25 @@ class PersonalPool:
 
     @contextlib.contextmanager
     def schedd(self):
-        """Yield the :class:`htcondor.Schedd` for this pool's schedd."""
+        """
+        A context manager that returns the
+        :class:`htcondor.Schedd` for the personal pool's schedd.
+        """
         with self.use_config():
             yield htcondor.Schedd()
 
     @contextlib.contextmanager
     def collector(self):
-        """Yield the :class:`htcondor.Collector` for this pool's collector."""
+        """
+        A context manager that returns the
+        :class:`htcondor.Collector` for the personal pool's collector.
+        """
         with self.use_config():
             yield htcondor.Collector()
 
     @property
     def master_is_alive(self):
+        """``True`` if and only if the attached *condor_master* process is alive."""
         return self.condor_master is not None and self.condor_master.poll() is None
 
     def __enter__(self):
@@ -243,7 +261,16 @@ class PersonalPool:
         self.stop()
 
     @skip_if(PersonalPoolState.READY)
-    def start(self):
+    def start(self) -> "PersonalPool":
+        """
+        Start the personal condor (bringing it to the ``READY`` state from
+        either ``UNINITIALIZED`` or ``INITIALIZED``).
+
+        Returns
+        -------
+        self : PersonalPool
+            This method returns ``self``.
+        """
         logger.info("Starting {}".format(self))
 
         try:
@@ -266,10 +293,35 @@ class PersonalPool:
         PersonalPoolState.STARTING,
         PersonalPoolState.READY,
     )
-    def initialize(self, overwrite_config=True):
+    def initialize(self, overwrite_config=True) -> "PersonalPool":
+        """
+        Initialize the personal pool by creating its local directory and writing
+        out configuration files.
+
+        The contents of the local directory
+        (except for the configuration file if ``overwrite_config=True``)
+        will not be overridden.
+
+        Parameters
+        ----------
+        overwrite_config
+            If ``True``, the existing configuration file will be overwritten
+            with the configuration set up in the constructor.
+            If ``False`` and there is an existing configuration file, an
+            exception will be raised.
+            Defaults to ``True``.
+
+        Returns
+        -------
+        self : PersonalPool
+            This method returns ``self``.
+        """
         self._setup_local_dirs()
         self._write_config(overwrite=overwrite_config)
+
         self.state = PersonalPoolState.INITIALIZED
+
+        return self
 
     def _setup_local_dirs(self):
         for dir in (
@@ -286,7 +338,7 @@ class PersonalPool:
 
     def _write_config(self, overwrite=True):
         if not overwrite and self.config_file.exists():
-            raise Exception(
+            raise FileExistsError(
                 f"Found existing config file; refusing to write config because overwrite={overwrite}."
             )
 
@@ -355,13 +407,13 @@ class PersonalPool:
 
         self.state = PersonalPoolState.STARTING
 
-    def _daemons(self):
+    def _daemons(self) -> Set[str]:
         return set(self.get_config_val("DAEMON_LIST").split(" "))
 
     @skip_if(PersonalPoolState.READY)
     def _wait_for_ready(self, timeout=120):
         daemons = self._daemons()
-        master_log_path = self.master_log
+        master_log_path = self._master_log
 
         logger.debug(
             "Starting up daemons for {}, waiting for: {}".format(
@@ -415,7 +467,12 @@ class PersonalPool:
 
         raise TimeoutError("Standup for {} failed".format(self))
 
-    def who(self):
+    def who(self) -> classad.ClassAd:
+        """
+        Return the result of ``condor_who -quick``,
+        as a :class:`classad.ClassAd`.
+        If ``condor_who -quick`` fails, it returns an empty ad.
+        """
         who = self.run_command(["condor_who", "-quick"])
         try:
             return classad.parseOne(who.stdout)
@@ -431,6 +488,10 @@ class PersonalPool:
         PersonalPoolState.INITIALIZED,
     )
     def stop(self):
+        """
+        Stop the personal condor, bringing it from the ``READY`` state to
+        ``STOPPED``.
+        """
         if self._detach:
             logger.debug("Will not stop {} because it is detached".format(self))
             return
@@ -509,7 +570,7 @@ class PersonalPool:
 
             if elapsed > kill_after and not killed:
                 # TODO: in this path, we should also kill the other daemons
-                # TODO: we can find their pids by reading the master log
+                # TODO: we can find their pids from condor_who
                 self._kill_condor_master()
                 killed = True
 
@@ -524,75 +585,61 @@ class PersonalPool:
             )
         )
 
-    def run_command(self, *args, **kwargs):
+    def run_command(self, *args, **kwargs) -> subprocess.CompletedProcess:
         """
-        Execute a command with ``CONDOR_CONFIG`` set to point to this HTCondor pool.
-        Arguments and keyword arguments are passed through to :func:`~run_command`.
+        Execute a command against this personal pool.
+        Arguments and keyword arguments are passed through to :func:`run_command`.
         """
         with self.use_config():
             return run_command(*args, **kwargs)
 
     @property
-    def master_log(self) -> Path:
-        """A :class:`DaemonLog` for the pool's master."""
-        return self._get_log_path("MASTER")
+    def _master_log(self) -> Path:
+        return Path(self.get_config_val("MASTER_LOG"))
 
-    @property
-    def collector_log(self) -> Path:
-        """A :class:`DaemonLog` for the pool's collector."""
-        return self._get_log_path("COLLECTOR")
+    def get_config_val(self, macro: str, default: Optional[str] = None) -> str:
+        """
+        Get the value of a configuration macro.
+        The value will be "evaluated", meaning that other configuration macros
+        or functions inside it will be expanded.
+        
+        Parameters
+        ----------
+        macro
+            The configuration macro to look up the value for.
+        default
+            If not ``None``, and the config macro has no value, return this instead.
+            If ``None``, a :class:`KeyError` will be raised instead.
 
-    @property
-    def negotiator_log(self) -> Path:
-        """A :class:`DaemonLog` for the pool's negotiator."""
-        return self._get_log_path("NEGOTIATOR")
-
-    @property
-    def schedd_log(self) -> Path:
-        """A :class:`DaemonLog` for the pool's schedd."""
-        return self._get_log_path("SCHEDD")
-
-    @property
-    def startd_log(self) -> Path:
-        """A :class:`DaemonLog` for the pool's startd."""
-        return self._get_log_path("STARTD")
-
-    @property
-    def shadow_log(self) -> Path:
-        """A :class:`DaemonLog` for the pool's shadows."""
-        return self._get_log_path("SHADOW")
-
-    @property
-    def job_queue_log(self) -> Path:
-        """The path to the pool's job queue log."""
-        return self._get_log_path("JOB_QUEUE")
-
-    @property
-    def startd_address(self):
-        """The address of the pool's startd."""
-        return self._get_address_file("STARTD").read_text().splitlines()[0]
-
-    def _get_log_path(self, subsystem: str) -> Path:
-        return Path(self.get_config_val("{}_LOG".format(subsystem)))
-
-    def _get_address_file(self, subsystem: str) -> Path:
-        return Path(self.get_config_val("{}_ADDRESS_FILE".format(subsystem)))
-
-    def get_config_val(self, variable, default=NO_DEFAULT):
+        Returns
+        -------
+        value : str
+            The evaluated value of the configuration macro.
+        """
         with self.use_config():
             try:
-                return htcondor.param[variable]
+                return htcondor.param[macro]
             except KeyError:
-                if default is not NO_DEFAULT:
+                if default is not None:
                     return default
                 raise
 
-    def detach(self):
-        self._detach = True
-        return self
-
     @classmethod
-    def attach(cls, local_dir):
+    def attach(cls, local_dir: Optional[Path] = None) -> "PersonalPool":
+        """
+        Make a new :class:`PersonalPool` attached to an existing personal pool
+        that is already running in ``local_dir``.
+
+        Parameters
+        ----------
+        local_dir
+            The local directory for the existing personal pool.
+
+        Returns
+        -------
+        self : PersonalPool
+            This method returns ``self``.
+        """
         pool = cls(local_dir=local_dir)
 
         if not pool._is_ready():
@@ -605,6 +652,14 @@ class PersonalPool:
 
         return pool
 
+    def detach(self) -> "PersonalPool":
+        """
+        Detach the personal pool (as in the constructor argument),
+        and return ``self``.
+        """
+        self._detach = True
+        return self
+
 
 # TODO: cannot use os.waitpid on non-child process... need to do something else in that case
 # TODO: does this work on windows?
@@ -613,7 +668,7 @@ class AttachedCondorMaster:
         self.pid = pid
         self.returncode = None
 
-    def poll(self):
+    def poll(self) -> int:
         if self.returncode is None:
             pid, returncode = os.waitpid(self.pid, os.WNOHANG)
             if pid == self.pid:
@@ -621,14 +676,14 @@ class AttachedCondorMaster:
 
         return self.returncode
 
-    def wait(self, timeout: float):
+    def wait(self, timeout: float) -> int:
         end = time.time() + timeout
         while True:
             if self.poll() is not None:
                 break
             if time.time() > end:
                 raise subprocess.TimeoutExpired("condor_master", timeout)
-            time.sleep(0.0005)
+            time.sleep(0.001)
 
         return self.returncode
 
@@ -721,48 +776,38 @@ class SetCondorConfig:
 
 
 def run_command(
-    args: List[str], stdin=None, timeout: int = 60, log: bool = True,
-):
+    args: List[str],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    universal_newlines: bool = True,
+    **kwargs,
+) -> subprocess.CompletedProcess:
     """
-    Execute a command.
+    Execute a command in a subprocess, using :func:`subprocess.run` with
+    good defaults for executing HTCondor commands. All of the keyword
+    arguments of this function are passed directly to :func:`subprocess.run`.
 
     Parameters
     ----------
     args
-    stdin
-    timeout
-    log
+        The command to run, and its arguments, as a list of strings.
+    kwargs
+        All keyword arguments are passed to :func:`subprocess.run`.
 
     Returns
     -------
-
+    completed_process : subprocess.CompletedProcess
     """
-    if timeout is None:
-        raise TypeError("run_command timeout cannot be None")
-
-    args = list(map(str, args))
     p = subprocess.run(
-        args,
-        timeout=timeout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=stdin,
-        universal_newlines=True,
+        list(map(str, args)),
+        stdout=stdout,
+        stderr=stderr,
+        universal_newlines=universal_newlines,
+        **kwargs,
     )
+
     p.stdout = p.stdout.rstrip()
     p.stderr = p.stderr.rstrip()
-
-    msg_lines = [
-        "Ran command: {}".format(" ".join(p.args)),
-        "CONDOR_CONFIG = {}".format(os.environ.get("CONDOR_CONFIG", "<not set>")),
-        "exit code: {}".format(p.returncode),
-        "stdout:{}{}".format("\n" if "\n" in p.stdout else " ", p.stdout),
-        "stderr:{}{}".format("\n" if "\n" in p.stderr else " ", p.stderr),
-    ]
-    msg = "\n".join(msg_lines)
-
-    if log and p.returncode != 0:
-        logger.debug(msg)
 
     return p
 
