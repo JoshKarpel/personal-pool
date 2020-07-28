@@ -99,7 +99,7 @@ def skip_if(*states):
         def wrapper(self, *args, **kwargs):
             if self.state in states:
                 logger.debug(
-                    "Skipping call to {} for {} because it is {}".format(
+                    "Skipping call to {} for {} because it is {}.".format(
                         func.__name__, self, self.state
                     )
                 )
@@ -157,6 +157,7 @@ class PersonalPool:
             set during initialization, such that this personal pool appears to
             be the local HTCondor pool for all operations in this Python session,
             even ones that don't go through the :class:`PersonalPool` object.
+            The personal pool will also be initialized.
             Defaults to ``True``.
         """
         self._state = PersonalPoolState.UNINITIALIZED
@@ -186,6 +187,7 @@ class PersonalPool:
         self.condor_master = None
 
         if use_config:
+            self.initialize()
             logger.debug("Setting CONDOR_CONFIG globally for {}".format(self))
             self.use_config().set()
 
@@ -237,11 +239,6 @@ class PersonalPool:
         """
         with self.use_config():
             yield htcondor.Collector()
-
-    @property
-    def master_is_alive(self):
-        """``True`` if and only if the attached *condor_master* process is alive."""
-        return self.condor_master is not None and self.condor_master.poll() is None
 
     def __enter__(self):
         self.use_config().set()
@@ -471,21 +468,48 @@ class PersonalPool:
         """
         Return the result of ``condor_who -quick``,
         as a :class:`classad.ClassAd`.
-        If ``condor_who -quick`` fails, it returns an empty ad.
+        If ``condor_who -quick`` fails, or the output can't be parsed into
+        a sensible who ad, it returns an empty ad.
         """
         who = self.run_command(["condor_who", "-quick"])
+        print(who.stdout)
+
         try:
-            return classad.parseOne(who.stdout)
+            parsed = classad.parseOne(who.stdout)
+
+            # If there's no MASTER key in the parsed ad, it indicates
+            # that we actually got the special post-shutdown message
+            # from condor_who and should act like there's nothing there.
+            if "MASTER" not in parsed:
+                return classad.ClassAd()
+
+            return parsed
         except Exception:
             return classad.ClassAd()
+
+    def _condor_master_is_alive(self) -> bool:
+        if self._has_master:
+            return self.condor_master.poll() is None
+        else:
+            return bool(self.who())
+
+    def _master_pid(self) -> int:
+        if self._has_master:
+            return self.condor_master.pid
+        else:
+            return int(self.who()["MASTER_PID"])
+
+    def _daemon_pids(self) -> List[int]:
+        return [int(v) for k, v in self.who() if k.endswith("_PID")]
 
     def _is_ready(self) -> bool:
         return self.who().get("IsReady", False)
 
     @skip_if(
-        PersonalPoolState.STOPPED,
         PersonalPoolState.UNINITIALIZED,
         PersonalPoolState.INITIALIZED,
+        PersonalPoolState.STOPPING,
+        PersonalPoolState.STOPPED,
     )
     def stop(self):
         """
@@ -508,7 +532,7 @@ class PersonalPool:
         logger.info("Stopped {}".format(self))
 
     def _condor_off(self):
-        if not self.master_is_alive:
+        if not self._condor_master_is_alive():
             return
 
         off = self.run_command(["condor_off", "-daemon", "master"], timeout=30)
@@ -524,64 +548,67 @@ class PersonalPool:
 
         logger.debug("condor_off succeeded for {}: {}".format(self, off.stdout))
 
-    def _terminate_condor_master(self):
-        if not self.master_is_alive:
-            return
-
-        self.condor_master.terminate()
-        logger.debug(
-            "Sent terminate signal to condor_master (pid {}) for {}".format(
-                self.condor_master.pid, self
-            )
-        )
-
-    def _kill_condor_master(self):
-        self.condor_master.kill()
-        logger.debug(
-            "Sent kill signal to condor_master (pid {}) for {}".format(
-                self.condor_master.pid, self
-            )
-        )
-
     def _wait_for_master_to_terminate(self, kill_after=60, timeout=120):
         logger.debug(
             "Waiting for condor_master (pid {}) for {} to terminate".format(
-                self.condor_master.pid, self
+                self._master_pid(), self
             )
         )
 
         start = time.time()
         killed = False
         while True:
-            try:
-                self.condor_master.wait(timeout=5)
+            if not self._condor_master_is_alive():
                 break
-            except subprocess.TimeoutExpired:
-                pass
 
             elapsed = time.time() - start
 
             if not killed:
                 logger.debug(
-                    "condor_master for {} has not terminated yet, will kill in {} seconds".format(
+                    "condor_master for {} has not terminated yet, will kill in {} seconds.".format(
                         self, int(kill_after - elapsed)
                     )
                 )
 
             if elapsed > kill_after and not killed:
-                # TODO: in this path, we should also kill the other daemons
-                # TODO: we can find their pids from condor_who
-                self._kill_condor_master()
+                self._kill_condor_system()
                 killed = True
 
             if elapsed > timeout:
                 raise TimeoutError(
-                    "Timed out while waiting for condor_master to terminate"
+                    "Timed out while waiting for condor_master to terminate."
                 )
 
+            time.sleep(1)
+
+        logger.debug("condor_master for {} has terminated.".format(self))
+
+    def _terminate_condor_master(self):
+        if not self._condor_master_is_alive():
+            return
+
+        pid = self._master_pid()
+
+        if self._has_master:
+            self.condor_master.terminate()
+        else:
+            os.kill(pid, signal.SIGTERM)
+
         logger.debug(
-            "condor_master (pid {}) for {} has terminated with exit code {}".format(
-                self.condor_master.pid, self, self.condor_master.returncode
+            "Sent terminate signal to condor_master (pid {}) for {}".format(pid, self)
+        )
+
+    def _kill_condor_system(self):
+        if self._condor_master_is_alive():
+            return
+
+        pids = self._daemon_pids()
+        for pid in pids:
+            os.kill(pid, signal.SIGKILL)
+
+        logger.debug(
+            "Sent kill signals to condor daemons (pids {}) for {}".format(
+                ", ".join(map(str, pids)), self
             )
         )
 
@@ -644,54 +671,21 @@ class PersonalPool:
 
         if not pool._is_ready():
             raise Exception(
-                "There is not already a running HTCondor instance for {}".format(pool)
+                "There is not already a running HTCondor instance for {}.".format(pool)
             )
 
-        pool.condor_master = AttachedCondorMaster(pid=pool.who()["MASTER_PID"])
         pool.state = PersonalPoolState.READY
 
         return pool
 
     def detach(self) -> "PersonalPool":
         """
-        Detach the personal pool (as in the constructor argument),
+        Detach the personal pool
+        (as in the constructor argument),
         and return ``self``.
         """
         self._detach = True
         return self
-
-
-# TODO: cannot use os.waitpid on non-child process... need to do something else in that case
-# TODO: does this work on windows?
-class AttachedCondorMaster:
-    def __init__(self, pid: int):
-        self.pid = pid
-        self.returncode = None
-
-    def poll(self) -> int:
-        if self.returncode is None:
-            pid, returncode = os.waitpid(self.pid, os.WNOHANG)
-            if pid == self.pid:
-                self.returncode = returncode
-
-        return self.returncode
-
-    def wait(self, timeout: float) -> int:
-        end = time.time() + timeout
-        while True:
-            if self.poll() is not None:
-                break
-            if time.time() > end:
-                raise subprocess.TimeoutExpired("condor_master", timeout)
-            time.sleep(0.001)
-
-        return self.returncode
-
-    def terminate(self):
-        os.kill(self.pid, signal.SIGTERM)
-
-    def kill(self):
-        os.kill(self.pid, signal.SIGKILL)
 
 
 def set_env_var(key: str, value: str):
