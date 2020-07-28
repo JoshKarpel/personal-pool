@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Mapping, List, Set, Union
+from typing import Optional, Mapping, List, Set
 
 import logging
 import atexit
@@ -34,8 +34,6 @@ import classad
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
-    # "ALL_DEBUG": "D_ALL",
-    # "TOOL_DEBUG": "D_ALL",
     "LOCAL_CONFIG_FILE": "",
     "MASTER_ADDRESS_FILE": "$(LOG)/.master_address",
     "COLLECTOR_ADDRESS_FILE": "$(LOG)/.collector_address",
@@ -333,7 +331,7 @@ class PersonalPool:
         ):
             dir.mkdir(parents=True, exist_ok=True)
 
-    def _write_config(self, overwrite=True):
+    def _write_config(self, overwrite: bool = True) -> None:
         if not overwrite and self.config_file.exists():
             raise FileExistsError(
                 f"Found existing config file; refusing to write config because overwrite={overwrite}."
@@ -380,10 +378,6 @@ class PersonalPool:
 
         with self.config_file.open(mode="a") as f:
             f.write("\n".join(param_lines))
-
-    @property
-    def _has_master(self):
-        return self.condor_master is not None
 
     @skip_if(PersonalPoolState.STARTING, PersonalPoolState.READY)
     def _start_condor(self):
@@ -469,10 +463,9 @@ class PersonalPool:
         Return the result of ``condor_who -quick``,
         as a :class:`classad.ClassAd`.
         If ``condor_who -quick`` fails, or the output can't be parsed into
-        a sensible who ad, it returns an empty ad.
+        a sensible who ad, this method returns an empty ad.
         """
         who = self.run_command(["condor_who", "-quick"])
-        print(who.stdout)
 
         try:
             parsed = classad.parseOne(who.stdout)
@@ -488,13 +481,13 @@ class PersonalPool:
             return classad.ClassAd()
 
     def _condor_master_is_alive(self) -> bool:
-        if self._has_master:
+        if self.condor_master is not None:
             return self.condor_master.poll() is None
         else:
             return bool(self.who())
 
     def _master_pid(self) -> int:
-        if self._has_master:
+        if self.condor_master is not None:
             return self.condor_master.pid
         else:
             return int(self.who()["MASTER_PID"])
