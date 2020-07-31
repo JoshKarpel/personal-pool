@@ -31,6 +31,8 @@ import signal
 import htcondor
 import classad
 
+__all__ = ["PersonalPool", "PersonalPoolState", "SetCondorConfig"]
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG = {
@@ -46,8 +48,6 @@ DEFAULT_CONFIG = {
     "STARTER_UPDATE_INTERVAL": "2",
     "STARTER_INITIAL_UPDATE_INTERVAL": "2",
     "NEGOTIATOR_CYCLE_DELAY": "2",
-    "RUNBENCHMARKS": "0",
-    "MAX_JOB_QUEUE_LOG_ROTATIONS": "0",
     # SECURITY
     "SEC_DAEMON_AUTHENTICATION": "REQUIRED",
     "SEC_CLIENT_AUTHENTICATION": "REQUIRED",
@@ -89,7 +89,8 @@ INHERIT = {
 }
 
 
-def skip_if(*states):
+def _skip_if(*states):
+    """Should only be applied to PersonalPool methods that return self."""
     states = set(states)
 
     def decorator(func):
@@ -101,7 +102,7 @@ def skip_if(*states):
                         func.__name__, self, self.state
                     )
                 )
-                return
+                return self
 
             return func(self, *args, **kwargs)
 
@@ -111,18 +112,23 @@ def skip_if(*states):
 
 
 class PersonalPoolState(str, enum.Enum):
-    UNINITIALIZED = "uninitialized"
-    INITIALIZED = "initialized"
-    STARTING = "starting"
-    READY = "ready"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
+    """
+    An enumeration of the possible states that a :class:`PersonalPool` can be in.
+    """
+
+    UNINITIALIZED = "UNINITIALIZED"
+    INITIALIZED = "INITIALIZED"
+    STARTING = "STARTING"
+    READY = "READY"
+    STOPPING = "STOPPING"
+    STOPPED = "STOPPED"
 
 
 class PersonalPool:
     """
-    A :class:`PersonalCondor` is responsible for managing the lifecycle of a
-    personal HTCondor pool.
+    A :class:`PersonalPool` is responsible for managing the lifecycle of a
+    personal HTCondor pool. It can be used to start and stop a personal pool,
+    and can also "attach" to an existing personal pool that is already running.
     """
 
     def __init__(
@@ -163,7 +169,7 @@ class PersonalPool:
 
         if local_dir is None:
             local_dir = Path.home() / ".condor" / "personal"
-        self.local_dir = local_dir.absolute()
+        self.local_dir = Path(local_dir).absolute()
 
         self._detach = detach
 
@@ -204,8 +210,8 @@ class PersonalPool:
         shortest_path = min(
             (
                 str(self.local_dir),
-                "~/" + str(try_relative_to(self.local_dir, Path.home())),
-                "./" + str(try_relative_to(self.local_dir, Path.cwd())),
+                "~/" + str(_try_relative_to(self.local_dir, Path.home())),
+                "./" + str(_try_relative_to(self.local_dir, Path.cwd())),
             ),
             key=len,
         )
@@ -215,15 +221,15 @@ class PersonalPool:
 
     def use_config(self):
         """
-        Returns a context manager that sets ``CONDOR_CONFIG`` to point to the
-        config file for this HTCondor pool.
+        Returns a :class:`SetCondorConfig` context manager that sets
+        ``CONDOR_CONFIG`` to point to the configuration file for this personal pool.
         """
         return SetCondorConfig(self.config_file)
 
     @contextlib.contextmanager
     def schedd(self):
         """
-        A context manager that returns the
+        Returns a context manager that provides the
         :class:`htcondor.Schedd` for the personal pool's schedd.
         """
         with self.use_config():
@@ -232,7 +238,7 @@ class PersonalPool:
     @contextlib.contextmanager
     def collector(self):
         """
-        A context manager that returns the
+        Returns a context manager that provides the
         :class:`htcondor.Collector` for the personal pool's collector.
         """
         with self.use_config():
@@ -240,7 +246,7 @@ class PersonalPool:
 
     def __enter__(self):
         self.use_config().set()
-        return self
+        return self.start()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         logger.debug("Stop triggered for {} by context exit.".format(self))
@@ -255,7 +261,7 @@ class PersonalPool:
         logger.debug("Stop triggered for {} by interpreter shutdown.".format(self))
         self.stop()
 
-    @skip_if(PersonalPoolState.READY)
+    @_skip_if(PersonalPoolState.READY)
     def start(self) -> "PersonalPool":
         """
         Start the personal condor (bringing it to the ``READY`` state from
@@ -283,7 +289,7 @@ class PersonalPool:
 
         return self
 
-    @skip_if(
+    @_skip_if(
         PersonalPoolState.INITIALIZED,
         PersonalPoolState.STARTING,
         PersonalPoolState.READY,
@@ -330,6 +336,9 @@ class PersonalPool:
             self.tokens_dir,
         ):
             dir.mkdir(parents=True, exist_ok=True)
+
+        self.passwords_dir.chmod(0o700)
+        self.tokens_dir.chmod(0o700)
 
     def _write_config(self, overwrite: bool = True) -> None:
         if not overwrite and self.config_file.exists():
@@ -379,7 +388,7 @@ class PersonalPool:
         with self.config_file.open(mode="a") as f:
             f.write("\n".join(param_lines))
 
-    @skip_if(PersonalPoolState.STARTING, PersonalPoolState.READY)
+    @_skip_if(PersonalPoolState.STARTING, PersonalPoolState.READY)
     def _start_condor(self):
         if self._is_ready():
             raise Exception(
@@ -398,10 +407,12 @@ class PersonalPool:
 
         self.state = PersonalPoolState.STARTING
 
+        return self
+
     def _daemons(self) -> Set[str]:
         return set(self.get_config_val("DAEMON_LIST").split(" "))
 
-    @skip_if(PersonalPoolState.READY)
+    @_skip_if(PersonalPoolState.READY)
     def _wait_for_ready(self, timeout=120):
         daemons = self._daemons()
         master_log_path = self._master_log
@@ -448,7 +459,7 @@ class PersonalPool:
                 and all(who_ad.get(d) == "Alive" for d in daemons)
             ):
                 self.state = PersonalPoolState.READY
-                return
+                return self
 
             logger.debug(
                 "{} is waiting for daemons to be ready (giving up in {} seconds)".format(
@@ -498,7 +509,7 @@ class PersonalPool:
     def _is_ready(self) -> bool:
         return self.who().get("IsReady", False)
 
-    @skip_if(
+    @_skip_if(
         PersonalPoolState.UNINITIALIZED,
         PersonalPoolState.INITIALIZED,
         PersonalPoolState.STOPPING,
@@ -508,10 +519,15 @@ class PersonalPool:
         """
         Stop the personal condor, bringing it from the ``READY`` state to
         ``STOPPED``.
+
+        Returns
+        -------
+        self : PersonalPool
+            This method returns ``self``.
         """
         if self._detach:
             logger.debug("Will not stop {} because it is detached".format(self))
-            return
+            return self
 
         logger.info("Stopping {}".format(self))
 
@@ -523,6 +539,8 @@ class PersonalPool:
         self.state = PersonalPoolState.STOPPED
 
         logger.info("Stopped {}".format(self))
+
+        return self
 
     def _condor_off(self):
         if not self._condor_master_is_alive():
@@ -582,7 +600,7 @@ class PersonalPool:
 
         pid = self._master_pid()
 
-        if self._has_master:
+        if self.condor_master is not None:
             self.condor_master.terminate()
         else:
             os.kill(pid, signal.SIGTERM)
@@ -605,13 +623,47 @@ class PersonalPool:
             )
         )
 
-    def run_command(self, *args, **kwargs) -> subprocess.CompletedProcess:
+    def run_command(
+        self,
+        args: List[str],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines: bool = True,
+        **kwargs,
+    ) -> subprocess.CompletedProcess:
         """
-        Execute a command against this personal pool.
-        Arguments and keyword arguments are passed through to :func:`run_command`.
+        Execute a command in a subprocess against this personal pool,
+        using :func:`subprocess.run` with good defaults for executing
+        HTCondor commands.
+        All of the keyword arguments of this function are passed directly to
+        :func:`subprocess.run`.
+
+        Parameters
+        ----------
+        args
+            The command to run, and its arguments, as a list of strings.
+        kwargs
+            All keyword arguments
+            (including ``stdout``, ``stderr``, and ``universal_newlines``)
+            are passed to :func:`subprocess.run`.
+
+        Returns
+        -------
+        completed_process : subprocess.CompletedProcess
         """
         with self.use_config():
-            return run_command(*args, **kwargs)
+            p = subprocess.run(
+                list(map(str, args)),
+                stdout=stdout,
+                stderr=stderr,
+                universal_newlines=universal_newlines,
+                **kwargs,
+            )
+
+            p.stdout = p.stdout.rstrip()
+            p.stderr = p.stderr.rstrip()
+
+            return p
 
     @property
     def _master_log(self) -> Path:
@@ -622,7 +674,7 @@ class PersonalPool:
         Get the value of a configuration macro.
         The value will be "evaluated", meaning that other configuration macros
         or functions inside it will be expanded.
-        
+
         Parameters
         ----------
         macro
@@ -681,52 +733,11 @@ class PersonalPool:
         return self
 
 
-def set_env_var(key: str, value: str):
-    os.environ[key] = value
-
-
-def unset_env_var(key: str):
-    value = os.environ.get(key, None)
-
-    if value is not None:
-        del os.environ[key]
-
-
-class SetEnv:
-    """
-    A context manager for setting environment variables.
-    Inside the context manager's block, the environment is updated according
-    to the mapping. When the block ends, the environment is reset to whatever
-    it was before entering the block.
-    If you need to change the ``CONDOR_CONFIG``, use the specialized
-    :func:`SetCondorConfig`.
-    """
-
-    UNSET = object()
-
-    def __init__(self, mapping: Mapping[str, str]):
-        self.mapping = mapping
-        self.previous_values = None
-
-    def set(self):
-        self.previous_values = {
-            key: os.environ.get(key, self.UNSET) for key in self.mapping.keys()
-        }
-        os.environ.update(self.mapping)
-
-    def unset(self):
-        for key, prev_val in self.previous_values.items():
-            if prev_val is not self.UNSET:
-                set_env_var(key, prev_val)
-            else:
-                unset_env_var(key)
-
-    def __enter__(self):
-        self.set()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.unset()
+def _try_relative_to(path: Path, to: Path) -> Path:
+    try:
+        return path.relative_to(to)
+    except ValueError:
+        return path
 
 
 class SetCondorConfig:
@@ -737,22 +748,29 @@ class SetCondorConfig:
     """
 
     def __init__(self, config_file: Path):
+        """
+        Parameters
+        ----------
+        config_file
+            The path to an HTCondor configuration file.
+        """
         self.config_file = Path(config_file)
         self.previous_value = None
 
     def set(self):
+        """Set ``CONDOR_CONFIG`` and tell HTCondor to reconfigure."""
         self.previous_value = os.environ.get("CONDOR_CONFIG", None)
-        set_env_var("CONDOR_CONFIG", str(self.config_file))
+        _set_env_var("CONDOR_CONFIG", str(self.config_file))
 
         htcondor.reload_config()
 
     def unset(self):
+        """Un-set ``CONDOR_CONFIG`` and tell HTCondor to reconfigure."""
         if self.previous_value is not None:
-            set_env_var("CONDOR_CONFIG", self.previous_value)
+            _set_env_var("CONDOR_CONFIG", self.previous_value)
+            htcondor.reload_config()
         else:
-            unset_env_var("CONDOR_CONFIG")
-
-        htcondor.reload_config()
+            _unset_env_var("CONDOR_CONFIG")
 
     def __enter__(self):
         self.set()
@@ -762,45 +780,12 @@ class SetCondorConfig:
         self.unset()
 
 
-def run_command(
-    args: List[str],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    universal_newlines: bool = True,
-    **kwargs,
-) -> subprocess.CompletedProcess:
-    """
-    Execute a command in a subprocess, using :func:`subprocess.run` with
-    good defaults for executing HTCondor commands. All of the keyword
-    arguments of this function are passed directly to :func:`subprocess.run`.
-
-    Parameters
-    ----------
-    args
-        The command to run, and its arguments, as a list of strings.
-    kwargs
-        All keyword arguments are passed to :func:`subprocess.run`.
-
-    Returns
-    -------
-    completed_process : subprocess.CompletedProcess
-    """
-    p = subprocess.run(
-        list(map(str, args)),
-        stdout=stdout,
-        stderr=stderr,
-        universal_newlines=universal_newlines,
-        **kwargs,
-    )
-
-    p.stdout = p.stdout.rstrip()
-    p.stderr = p.stderr.rstrip()
-
-    return p
+def _set_env_var(key: str, value: str):
+    os.environ[key] = value
 
 
-def try_relative_to(path: Path, to: Path) -> Path:
-    try:
-        return path.relative_to(to)
-    except ValueError:
-        return path
+def _unset_env_var(key: str):
+    value = os.environ.get(key, None)
+
+    if value is not None:
+        del os.environ[key]
